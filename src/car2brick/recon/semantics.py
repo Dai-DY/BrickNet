@@ -62,18 +62,23 @@ def project_colors(points_world, cameras: list[Camera], images: list[np.ndarray]
 
 
 def project_labels(points_world, cameras: list[Camera], label_masks: dict[int, list[np.ndarray]],
-                   min_votes: int = 2) -> np.ndarray:
-    """Per-point label: the label voted by most views (>= min_votes), else 1 (body)."""
+                   min_votes: int = 2, min_share: float = 0.5) -> np.ndarray:
+    """Per-point label: the label voted by most views (>= min_votes and >= min_share of the views that see the
+    point), else 1 (body)."""
     codes = sorted(label_masks)
     votes = np.zeros((len(points_world), len(codes)), dtype=np.int32)
+    seen = np.zeros(len(points_world), dtype=np.int32)
     for ci, code in enumerate(codes):
         for cam, mask in zip(cameras, label_masks[code]):
             vis = visible(points_world, cam, mask.shape)
+            if ci == 0:
+                seen += vis
             uv, _ = cam.project(points_world[vis])
             votes[np.nonzero(vis)[0], ci] += mask[uv[:, 1].astype(int), uv[:, 0].astype(int)]
     best = votes.argmax(1)
     out = np.ones(len(points_world), dtype=np.uint8)
-    hit = votes.max(1) >= min_votes
+    # majority of the views that see the point (visibility is approximate, so single votes are noise)
+    hit = (votes.max(1) >= min_votes) & (votes.max(1) >= min_share * seen)
     out[hit] = np.array(codes, dtype=np.uint8)[best[hit]]
     return out
 

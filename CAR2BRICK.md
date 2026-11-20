@@ -35,6 +35,8 @@
 | `src/car2brick/evaluate.py` | IoU、连通性、碰撞；网格位姿 → LDraw；按目标颜色重新上色 |
 | `scripts/train_car2brick.py` | 复用 BrickNet 的 `scripts/train.py sft`，只覆盖序列长度、步数等配置 |
 | `scripts/car2brick_smoke.py` | 无需下载的端到端冒烟测试（小模型记住一辆车再生成出来） |
+| `scripts/car2brick_demo.py` | 生成示例图：合成照片 → 描述 → B0/B1 基线（输出在 `docs/car2brick/`） |
+| `src/car2brick/render.py` | 无额外依赖的预览渲染器（numpy z-buffer + PIL） |
 | `tests/car2brick/` | 单元测试与合成数据 |
 
 对 BrickNet 原有代码只改了一处：`bricknet/score.py` 改为延迟导入 `collision`，这样没装 pybullet 也能解析序列。
@@ -176,7 +178,13 @@ python -m car2brick eval b1.ldr car.npz
 
 ---
 
-## 6. 已验证内容（在本仓库的云端环境中）
+## 6. 示例图
+
+`python scripts/car2brick_demo.py` 用测试里的合成样车生成 `docs/car2brick/overview.png`：36 张合成照片 → 前半段得到的描述（蓝灰色为车窗格子）→ B0 → B1。这些图只展示前半段和非学习基线，学习模型需要在 BrickNet 数据上训练后才有官方风格的效果。
+
+![overview](docs/car2brick/overview.png)
+
+## 6.1 已验证内容（在本仓库的云端环境中）
 
 没有 GPU，也无法访问 HuggingFace、LDraw 和 BrickNet 的数据下载地址，所以用合成数据和包内自带的连接点标注做验证：
 

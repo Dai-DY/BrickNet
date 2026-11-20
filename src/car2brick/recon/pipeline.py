@@ -81,5 +81,5 @@ def photos_to_descriptor(
     # the hull cannot see under the car, so prefer tyre colour over the occupancy contact profile
     wx = wheels_from_dark_points(pts_car[surf], rgb)
     if wx:
-        out.wheels = tuple(round((x - out.origin[0]) / LDU_PER_STUD, 1) for x in wx)
+        out.wheels = tuple(float(round((x - out.origin[0]) / LDU_PER_STUD, 1)) for x in wx)
     return out
