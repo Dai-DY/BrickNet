@@ -55,6 +55,14 @@ class CarDescriptor:
     wheels: tuple[float, ...] = ()  # wheel-centre x positions, in cells from the grid start
     colors: tuple[str, ...] = ()  # BrickNet colour names, main first
     labels: np.ndarray | None = None  # (L, W, H) uint8 semantic labels, optional
+    fine: np.ndarray | None = None  # (L*sx, W*sy, H*sz) bool supersampled occupancy, optional (fitting baseline)
+
+    def fine_target(self) -> np.ndarray:
+        """Supersampled solid mask; falls back to repeating solid cells when ``fine`` is unknown."""
+        if self.fine is not None:
+            return self.fine
+        sx, sy, sz = self.spec.sub
+        return self.solid().repeat(sx, 0).repeat(sy, 1).repeat(sz, 2)
 
     # ---- basic views ------------------------------------------------------------------------------------------
     def solid(self, thr: float = 0.55) -> np.ndarray:
@@ -79,7 +87,8 @@ class CarDescriptor:
     def symmetrized(self) -> "CarDescriptor":
         occ = 0.5 * (self.occupancy + self.occupancy[:, ::-1])
         lab = None if self.labels is None else np.maximum(self.labels, self.labels[:, ::-1])
-        return replace(self, occupancy=occ.astype(np.float32), labels=lab)
+        fine = None if self.fine is None else self.fine | self.fine[:, ::-1]
+        return replace(self, occupancy=occ.astype(np.float32), labels=lab, fine=fine)
 
     def allowed(self, margin=(1, 1, 2), thr: float = 0.3) -> np.ndarray:
         """Cells a generated part may occupy: the (loosely thresholded) shape dilated by ``margin`` cells."""
@@ -187,7 +196,7 @@ class CarDescriptor:
             elif top > ks.min():
                 solid[i, j, top] = False
         wheels = tuple(round(w + rng.uniform(-0.5, 0.5) * strength, 1) for w in self.wheels)
-        out = replace(self, occupancy=solid.astype(np.float32), wheels=wheels)
+        out = replace(self, occupancy=solid.astype(np.float32), wheels=wheels, fine=None)
         return out.symmetrized()
 
     # ---- io ---------------------------------------------------------------------------------------------------
@@ -200,16 +209,21 @@ class CarDescriptor:
             wheels=np.array(self.wheels, dtype=np.float64),
             colors=np.array(self.colors, dtype=str),
             labels=self.labels if self.labels is not None else np.zeros(0, dtype=np.uint8),
+            fine=np.packbits(self.fine) if self.fine is not None else np.zeros(0, dtype=np.uint8),
         )
 
     @classmethod
     def load(cls, path) -> "CarDescriptor":
         d = np.load(path, allow_pickle=False)
         s = [int(v) for v in d["spec"]]
+        spec = GridSpec(*s[:3], tuple(s[3:]))
         labels = d["labels"] if d["labels"].size else None
+        fine = None
+        if "fine" in d.files and d["fine"].size:
+            n = np.array(spec.shape) * np.array(spec.sub)
+            fine = np.unpackbits(d["fine"])[: n.prod()].reshape(n).astype(bool)
         return cls(
-            d["occupancy"], GridSpec(*s[:3], tuple(s[3:])), d["origin"], tuple(d["wheels"].tolist()),
-            tuple(d["colors"].tolist()), labels,
+            d["occupancy"], spec, d["origin"], tuple(d["wheels"].tolist()), tuple(d["colors"].tolist()), labels, fine,
         )
 
 
@@ -286,4 +300,4 @@ def descriptor_from_points(
             m = lab == code
             labels[tuple(cidx[m].T)] = code
     occ = occ.astype(np.float32)
-    return CarDescriptor(occ, spec, origin, detect_wheels(occ), tuple(colors), labels)
+    return CarDescriptor(occ, spec, origin, detect_wheels(occ), tuple(colors), labels, fine)

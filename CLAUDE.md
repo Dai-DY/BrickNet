@@ -34,8 +34,9 @@
    - 同款"真车 ↔ 官方套装"对用作最终评测集
 
 ## 当前状态（`car2brick` 分支）
-- 前半段、桥、后半段（数据构建、训练封装、约束解码、自训练、评测、基线）、命令行、预览渲染都已完成。
-- `pytest tests/car2brick`：20 个测试通过。
+- 前半段、桥、后半段（数据构建、训练封装、约束解码、自训练、评测）、命令行、预览渲染都已完成。
+- 非学习基线：B0（贪心铺板）、B1（+ tile）、B2（逐零件拟合，带斜面，规则见 `CAR2BRICK.md` 5.7 和 `fit.py` 文件开头）。
+- `pytest tests/car2brick`：25 个测试通过。
 - `scripts/car2brick_smoke.py`：小模型记住一辆车后，能用完整的生成流程完全复现。
 - `scripts/car2brick_demo.py`：生成 `docs/car2brick/overview.png`。
 - **以上都只在合成数据上验证过。** 还没有用过：真实照片、真实运行的 COLMAP / SAM2、BrickNet 数据和权重、GPU 训练、碰撞体文件。

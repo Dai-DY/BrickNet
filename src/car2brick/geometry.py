@@ -119,7 +119,42 @@ class PartShapes:
         v = self.ldraw.vertices(self.catalog.id_to_stem[part_id] + ".dat")
         return [v] if len(v) >= 4 else None
 
+    def _studded_slope_hull(self, part_id: int) -> np.ndarray | None:
+        """Wedge for slopes whose studs sit on part of the footprint (45/33/18 degree bricks): full height under
+        the stud row, ramping down to a 4 LDU lip at the far edge. None for anything else."""
+        frames = bricknet.load_connectors().get(part_id, {})
+        studs = np.array([f[:3, 3] for f in frames.get(("stud", None), ())]).reshape(-1, 3)
+        holes = np.array([f[:3, 3] for f in frames.get(("hole", None), ())]).reshape(-1, 3)
+        if not len(studs) or len(holes) <= len(studs) or np.ptp(studs[:, 1]) > 0.5:
+            return None
+        holes = holes[holes[:, 1] >= holes[:, 1].max() - 0.5]
+        bottom, top = holes[0, 1], studs[0, 1]
+        if bottom - top < 16:  # only brick-height slopes
+            return None
+        for a, b in ((2, 0), (0, 2)):  # a: slope axis, b: across
+            if np.ptp(studs[:, a]) > 0.5:
+                continue
+            lo_side = holes[:, a] < studs[:, a].min() - 0.5
+            hi_side = holes[:, a] > studs[:, a].max() + 0.5
+            if lo_side.any() == hi_side.any():
+                continue
+            far = holes[:, a].min() - 10.0 if lo_side.any() else holes[:, a].max() + 10.0
+            near = studs[0, a] + (-10.0 if lo_side.any() else 10.0)
+            back = studs[0, a] + (10.0 if lo_side.any() else -10.0)
+            w0, w1 = holes[:, b].min() - 10.0, holes[:, b].max() + 10.0
+            pts = []
+            for w in (w0, w1):
+                for (pa, py) in ((back, top), (near, top), (back, bottom), (far, bottom), (far, bottom - 4.0)):
+                    p = np.zeros(3)
+                    p[a], p[b], p[1] = pa, w, py
+                    pts.append(p)
+            return np.array(pts)
+        return None
+
     def _connector_hulls(self, part_id: int) -> list[np.ndarray]:
+        wedge = self._studded_slope_hull(part_id)
+        if wedge is not None:
+            return [wedge]
         frames = bricknet.load_connectors().get(part_id, {})
         pts = []
         for (sub, _pol), group in frames.items():

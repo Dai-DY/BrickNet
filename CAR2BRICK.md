@@ -32,6 +32,7 @@
 | `src/car2brick/dataset.py` | 从 BrickNet 图 / LDraw 文件夹生成 SFT 数据（与 BrickNet 训练脚本格式一致） |
 | `src/car2brick/selftrain.py` | ShapeNet 自训练：生成 → 筛选 → 写回训练格式 |
 | `src/car2brick/baseline.py` | 非学习基线：B0 贪心铺板，B1 再加顶面 tile |
+| `src/car2brick/fit.py` | 非学习基线 B2：逐零件拟合（砖、斜面、板、tile），规则见 5.7 |
 | `src/car2brick/evaluate.py` | IoU、连通性、碰撞；网格位姿 → LDraw；按目标颜色重新上色 |
 | `scripts/train_car2brick.py` | 复用 BrickNet 的 `scripts/train.py sft`，只覆盖序列长度、步数等配置 |
 | `scripts/car2brick_smoke.py` | 无需下载的端到端冒烟测试（小模型记住一辆车再生成出来） |
@@ -171,16 +172,44 @@ cat data/captions_train.jsonl st1/captions_selftrain.jsonl > mix/captions.jsonl
 
 ### 5.6 基线与评测
 ```bash
-python -m car2brick baseline car.npz --out b1.ldr             # B1（顶面 tile）
-python -m car2brick baseline car.npz --out b0.ldr --no-tiles  # B0
-python -m car2brick eval b1.ldr car.npz
+python -m car2brick baseline car.npz --method b0 --out b0.ldr   # B0：贪心铺板
+python -m car2brick baseline car.npz --method b1 --out b1.ldr   # B1：加顶面 tile
+python -m car2brick baseline car.npz --method b2 --out b2.ldr   # B2：逐零件拟合
+python -m car2brick eval b2.ldr car.npz
 ```
+
+### 5.7 B2 逐零件拟合的规则（`fit.py`）
+从最底层往上，一次放一个零件。每一步从零件库（板、砖、45°/33°/18° 带凸点斜面、tile）里，选出位置和朝向都最贴合目标形状的那个。
+
+**硬约束**（违反就不放）：
+1. 零件落在 stud 网格上，凸点朝上，只做 90° 旋转（这个基线不做侧装）
+2. 不能和已放的零件重叠（以半 stud × 半 stud × 半 plate 的子格为单位判断）
+3. 必须有支撑：至少一个底孔压在下方零件的空闲凸点上；只有脚下在目标形状里为空时（比如两个车轮之间的底板），才允许作为"底座"件直接放
+4. 左右对称：每放一块，同时放它的镜像
+5. 统一层次：砖和斜面这种 3 层板高的零件，只能从车身底面所在层起步，每 3 层一档；其他高度用板来补。否则相邻区域会错开一层板，上面的零件永远没法把它们连起来
+
+**打分**（对零件会占据的每个子格求和）：
+- 在目标里：+1
+- 紧挨目标外面一圈：−0.5（容忍目标本身的粗糙）
+- 明显在目标外：−3（溢出比少一格更糟）
+- 每额外连通一个原本分开的块：+0.5 × 零件体积（鼓励错缝咬合，保证整辆车是一体的）
+- 得分至少要达到零件体积的 60%，零件才有资格被放
+
+**顺序**：逐层从下往上；同一层里按得分从高到低放（大零件自然得分更高，所以零件总数少）。
+
+**收尾**：
+- 顶面完全露出的板，换成同尺寸的 tile
+- 覆盖车窗格子的零件用透明黑色，其余用主色
+
+**斜面几何**：带凸点的斜面在没有零件模型时用解析楔形（凸点那排是高端，低端留 4 LDU 的边）。芝士斜面需要真实几何（BrickNet 碰撞体或 LDraw 库），装了才会启用。曲面斜面底部不规整，这一版没有用。
+
+**效果**（`docs/car2brick/6_sloped_b1_vs_b2.png`）：在有斜车头的样车上，B2 用 18° 斜面做出了斜引擎盖，B1 那里是板的台阶；零件数 76，B1 是 84。风挡和后窗仍是台阶，因为目前只有 1–2 宽的斜面，而且斜面必须从统一的层次起步。
 
 ---
 
 ## 6. 示例图
 
-`python scripts/car2brick_demo.py` 用测试里的合成样车生成 `docs/car2brick/overview.png`：36 张合成照片 → 前半段得到的描述（蓝灰色为车窗格子）→ B0 → B1。这些图只展示前半段和非学习基线，学习模型需要在 BrickNet 数据上训练后才有官方风格的效果。
+`python scripts/car2brick_demo.py` 用测试里的合成样车生成 `docs/car2brick/overview.png`：36 张合成照片 → 前半段得到的描述（蓝灰色为车窗格子）→ B0 → B1 → B2。另有 `6_sloped_b1_vs_b2.png`，在带斜面的样车上对比 B1 和 B2。这些图只展示前半段和非学习基线，学习模型需要在 BrickNet 数据上训练后才有官方风格的效果。
 
 ![overview](docs/car2brick/overview.png)
 
@@ -188,7 +217,7 @@ python -m car2brick eval b1.ldr car.npz
 
 没有 GPU，也无法访问 HuggingFace、LDraw 和 BrickNet 的数据下载地址，所以用合成数据和包内自带的连接点标注做验证：
 
-- `pytest tests/car2brick`：20 个测试全部通过
+- `pytest tests/car2brick`：25 个测试全部通过
   - **桥的往返**：合成车 → 描述 → B1 基线 `.ldr`（1 个连通分量）→ 再算描述，IoU > 0.95；文本序列化往返 IoU = 1.0
   - **前半段**：渲染 36 个视角的掩码和图片，写成 COLMAP 文本模型，跑 `photos_to_descriptor`：宽 8 stud，长和高与真值相差 1–2 格，主色红，车轮位置误差 < 10%，IoU > 0.6
   - **序列**：锚点序列能被 BrickNet 解析，重建位姿误差 < 1e-6
@@ -204,4 +233,4 @@ python -m car2brick eval b1.ldr car.npz
 - 视觉外壳在视角少时偏胖；视角多一些，或改用 `mesh2desc` 配合更好的表面重建
 - 零件几何在没有碰撞体或 LDraw 库时，用连接点凸包近似，对曲面件、车轮比较粗
 - `HFProposer` 每一步都重新编码前缀，没有复用 KV 缓存，长序列生成较慢（可以优化）
-- B0/B1 基线还没有斜面替换和车轮/底盘模板，可以作为补充
+- B2 还没有曲面斜面、侧装（SNOT）、车轮和底盘模板；风挡这种 5 层板高的斜面目前仍是台阶

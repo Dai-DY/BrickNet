@@ -7,7 +7,7 @@ Front half
   showdesc      print a descriptor as conditioning text
 
 Back half
-  baseline      descriptor -> LDraw (B0 greedy plates, B1 + tiles)
+  baseline      descriptor -> LDraw (B0 greedy plates, B1 + tiles, B2 part-by-part fitting)
   build-data    BrickNet graphs / LDraw folders -> SFT jsonl
   generate      descriptor -> LDraw with the fine-tuned model + constrained decoding
   selftrain     ShapeNet meshes -> generated examples for the next SFT round
@@ -74,7 +74,15 @@ def cmd_baseline(a):
     from .baseline import baseline_ldr
     from .descriptor import CarDescriptor
 
-    ldr = baseline_ldr(CarDescriptor.load(a.desc), cap_tiles=not a.no_tiles)
+    desc = CarDescriptor.load(a.desc)
+    method = "b0" if a.no_tiles else a.method
+    if method == "b2":
+        from .fit import fit_ldr
+
+        ldr, res = fit_ldr(desc, lambda_out=a.lambda_out, min_fill=a.min_fill, use_slopes=not a.no_slopes)
+        print(res.stats)
+    else:
+        ldr = baseline_ldr(desc, cap_tiles=method == "b1")
     Path(a.out).write_text(ldr)
     print(f"wrote {a.out} ({ldr.count(chr(10) + '1 ')} parts)")
 
@@ -169,7 +177,12 @@ def main(argv=None):
     p = sub.add_parser("baseline")
     p.add_argument("desc")
     p.add_argument("--out", required=True)
-    p.add_argument("--no-tiles", action="store_true", help="B0 (plates only) instead of B1 (tile capping)")
+    p.add_argument("--method", default="b1", choices=["b0", "b1", "b2"],
+                   help="b0 greedy plates, b1 + tiles, b2 part-by-part fitting with bricks and slopes")
+    p.add_argument("--no-tiles", action="store_true", help="same as --method b0")
+    p.add_argument("--lambda-out", type=float, default=3.0, help="b2: penalty per sub-cell outside the target")
+    p.add_argument("--min-fill", type=float, default=0.6, help="b2: minimum score per unit of part volume")
+    p.add_argument("--no-slopes", action="store_true", help="b2: plates and bricks only")
     p.set_defaults(func=cmd_baseline)
 
     from .dataset import add_args as data_args

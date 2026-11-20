@@ -8,6 +8,8 @@ Writes:
   2_descriptor.png        the stud x stud x plate descriptor recovered from the photos (windows marked)
   3_baseline_b0.png       B0: greedy plates
   4_baseline_b1.png       B1: plates + tiles on exposed tops
+  5_fit_b2.png            B2: part-by-part fitting (bricks + slopes) on the same descriptor
+  6_sloped_b1_vs_b2.png   B1 vs B2 on a car with a sloped nose / windscreen / fastback
   overview.png            all of the above in one sheet
   descriptor.txt          the conditioning text the generator would see
 """
@@ -25,8 +27,11 @@ sys.path.insert(0, str(ROOT / "tests" / "car2brick"))
 
 import bricknet  # noqa: E402
 import synthetic as S  # noqa: E402
+from conftest import sloped_car_points  # noqa: E402
 
 from car2brick.baseline import baseline_ldr  # noqa: E402
+from car2brick.descriptor import descriptor_from_points  # noqa: E402
+from car2brick.fit import fit_ldr  # noqa: E402
 from car2brick.lego import lego_car_from_ldr  # noqa: E402
 from car2brick.recon.masks import save_masks  # noqa: E402
 from car2brick.recon.pipeline import photos_to_descriptor  # noqa: E402
@@ -37,6 +42,19 @@ def two_views(tris, rgb, ids, center, dist):
     a = rasterize(tris, rgb, ids, orbit_camera(center, dist, -125, 28))
     b = rasterize(tris, rgb, ids, orbit_camera(center, dist, -90, 4))
     return hstack([a, b])
+
+
+def render_ldr(ldr, dist):
+    lc = lego_car_from_ldr(ldr)
+    gp = lc.grid_poses()
+    t, c, i = part_triangles(lc.part_ids, lc.colors, gp)
+    mid = 0.5 * (gp[:, :3, 3].min(0) + gp[:, :3, 3].max(0))
+    return two_views(t, c, i, mid, dist)
+
+
+def summary(ldr):
+    g = bricknet.parse_ldr(ldr)
+    return f"({len(g.part_ids)} parts, {len(g.components)} connected component{'s' if len(g.components) > 1 else ''})"
 
 
 def hstack(imgs, gap=8, bg=(255, 255, 255)):
@@ -108,22 +126,25 @@ def main():
                 f"colors={list(desc.colors)} (blue-grey = window cells)")
     p2.save(out / "2_descriptor.png")
 
-    # 3/4. baselines
+    # 3/4/5. baselines on the descriptor from the photos
     panels = [p1, p2]
-    for tiles, name, title in ((False, "3_baseline_b0.png", "3. B0 baseline: greedy plates"),
-                               (True, "4_baseline_b1.png", "4. B1 baseline: plates + tiles on exposed tops")):
-        ldr = baseline_ldr(desc, cap_tiles=tiles)
+    builds = (("3_baseline_b0.png", "3. B0 baseline: greedy plates", baseline_ldr(desc, cap_tiles=False)),
+              ("4_baseline_b1.png", "4. B1 baseline: plates + tiles on exposed tops", baseline_ldr(desc)),
+              ("5_fit_b2.png", "5. B2 baseline: part-by-part fitting (bricks, slopes, plates, tiles)",
+               fit_ldr(desc)[0]))
+    for name, title, ldr in builds:
         (out / name.replace(".png", ".ldr")).write_text(ldr)
-        lc = lego_car_from_ldr(ldr)
-        gp = lc.grid_poses()
-        t, c, i = part_triangles(lc.part_ids, lc.colors, gp)
-        mid = 0.5 * (gp[:, :3, 3].min(0) + gp[:, :3, 3].max(0))
-        g = bricknet.parse_ldr(ldr)
-        p = titled(two_views(t, c, i, mid, dist),
-                   f"{title}  ({len(g.part_ids)} parts, {len(g.components)} connected component)")
+        p = titled(render_ldr(ldr, dist), f"{title}  {summary(ldr)}")
         p.save(out / name)
         panels.append(p)
     vstack(panels).save(out / "overview.png")
+
+    # 6. where B2 differs: sloped nose / windscreen / fastback
+    sloped = descriptor_from_points(sloped_car_points(), colors=("blue", "black"))
+    rows = []
+    for title, ldr in (("B1", baseline_ldr(sloped)), ("B2", fit_ldr(sloped)[0])):
+        rows.append(titled(render_ldr(ldr, dist), f"{title} on a sloped car  {summary(ldr)}"))
+    vstack(rows).save(out / "6_sloped_b1_vs_b2.png")
     print(f"wrote {out}/overview.png")
     print(desc.to_text("official"))
 
