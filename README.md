@@ -12,6 +12,12 @@ CVPR 2026
 
 </div>
 
+## car2brick (this fork)
+
+Branch `car2brick` adds a real-car photos -> official-style LEGO pipeline on top of BrickNet: photo reconstruction
+and a stud-resolution shape descriptor (front half), descriptor-conditioned BrickNet fine-tuning with position
+anchors, shape-constrained decoding and ShapeNet self-training (back half). See [CAR2BRICK.md](CAR2BRICK.md).
+
 ## Updates
 
 ### 26-10-08 -- BrickBench

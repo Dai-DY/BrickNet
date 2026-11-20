@@ -15,7 +15,7 @@ import functools
 import json
 from concurrent.futures import ProcessPoolExecutor
 
-from .collision import check_placements, first_collision
+# collision (pybullet) is imported lazily so parsing works without it
 from .core import FixedEdge, Tree
 from .graph import decode_graph, tree_to_graph
 from .tree import parse_sample
@@ -28,11 +28,15 @@ def _fixed_parents(tree: Tree) -> dict[int, int]:
 
 def check_tree(tree: Tree) -> list[int] | None:
     """Colliding part indices under autoregressive placement, or None if a collider is unavailable."""
+    from .collision import check_placements
+
     return check_placements([p.part_id for p in tree.parts], decode_graph(tree_to_graph(tree)), _fixed_parents(tree))
 
 
 def collision_free_prefix(tree: Tree) -> int | None:
     """Collision-free prefix length (len(tree.parts) when clean), or None if a collider is unavailable."""
+    from .collision import first_collision
+
     return first_collision([p.part_id for p in tree.parts], decode_graph(tree_to_graph(tree)), _fixed_parents(tree))
 
 
