@@ -4,10 +4,22 @@ Both a real car (mesh / visual hull, after ``canonical.canonicalize``) and a LEG
 ``from_graph``) are reduced to the *same* ``CarDescriptor`` through ``descriptor_from_points``, which bins
 interior points of the object (car frame, LDU) into a grid of stud x stud x plate cells.
 
-The descriptor is deliberately coarse: it records how much of each cell is filled, where the wheels are, and the
-main colours. ``to_text`` serialises it as a half-width height map (the car is mirror-symmetric) that is used as
-the conditioning prefix of the generator; ``perturb`` is the training-time augmentation that makes LEGO-derived
+The descriptor records how much of each cell is filled, the colour class of each cell's visible surface, where the
+wheels are, and the main colours. ``to_text`` serialises it (half width: the car is mirror-symmetric) as the
+conditioning prefix of the generator; ``perturb`` is the training-time augmentation that makes LEGO-derived
 descriptors look like real-car ones.
+
+Text format ``v2`` (default) - one line per x row, one cell per half-width column from the centre outward::
+
+    17 1k1y5 3y4+11k1 5y2 .
+
+A cell lists the solid segments of that column bottom-up, joined by ``+``; a segment is its bottom plate followed by
+colour runs (class letter + number of plates, ``colors.CLASSES``: ``t`` glass, ``l`` light, ...). ``3y4+11k1``:
+yellow from plate 3 to 6, a gap, a black plate at 11 (a spoiler or a windscreen frame). Only gaps open to the
+outside are kept: cavities closed inside the body (LEGO cars are hollow, a visual hull is not) are filled
+(``profile``). Thin parts (a tile-thick wing) count when they are separated from the body by a gap.
+
+``v1`` (the first training runs): ``top[w|l]/bottom`` per column, no colours, no gaps.
 """
 
 from __future__ import annotations
@@ -18,10 +30,12 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 from scipy import ndimage
 
+from .colors import CLASS_INDEX, CLASSES, GLASS, LIGHT, class_of_name
 from .units import LDU_PER_PLATE, LDU_PER_STUD
 
 LABELS = {0: "", 1: "", 2: "w", 3: "l"}  # 1 = body, 2 = window, 3 = light; only 2 and 3 appear in text
 LABEL_CODES = {"w": 2, "l": 3}
+V2_CELL_RE = re.compile(r"\d+(?:[a-z]\d+)+(?:\+\d+(?:[a-z]\d+)+)*")
 
 
 @dataclass(frozen=True)
@@ -56,6 +70,7 @@ class CarDescriptor:
     colors: tuple[str, ...] = ()  # BrickNet colour names, main first
     labels: np.ndarray | None = None  # (L, W, H) uint8 semantic labels, optional
     fine: np.ndarray | None = None  # (L*sx, W*sy, H*sz) bool supersampled occupancy, optional (fitting baseline)
+    surface: np.ndarray | None = None  # (L, W, H) int8 colour class of the cell's visible surface, -1 unknown
 
     def fine_target(self) -> np.ndarray:
         """Supersampled solid mask; falls back to repeating solid cells when ``fine`` is unknown."""
@@ -79,8 +94,12 @@ class CarDescriptor:
         ext = self.extent(thr)
         return (0, 0, 0) if ext is None else tuple(s.stop - s.start for s in ext)
 
-    def iou(self, other: "CarDescriptor", thr: float = 0.55) -> float:
+    def iou(self, other: "CarDescriptor", thr: float = 0.55, filled: bool = False) -> float:
+        """Voxel IoU. ``filled``: compare outer shapes, each column filled from its lowest to its highest solid cell
+        (LEGO cars are hollow inside - open cockpits, empty bodies - while a descriptor from a mesh is solid)."""
         a, b = self.solid(thr), other.solid(thr)
+        if filled:
+            a, b = column_filled(a), column_filled(b)
         union = (a | b).sum()
         return float((a & b).sum() / union) if union else 1.0
 
@@ -88,7 +107,44 @@ class CarDescriptor:
         occ = 0.5 * (self.occupancy + self.occupancy[:, ::-1])
         lab = None if self.labels is None else np.maximum(self.labels, self.labels[:, ::-1])
         fine = None if self.fine is None else self.fine | self.fine[:, ::-1]
-        return replace(self, occupancy=occ.astype(np.float32), labels=lab, fine=fine)
+        surf = None
+        if self.surface is not None:
+            a, b = self.surface, self.surface[:, ::-1]
+            half = self.spec.width // 2
+            right = np.where(a >= 0, a, b)[:, half:]  # outer side first, its mirror where unknown
+            surf = np.concatenate([right[:, ::-1], right], 1).astype(np.int8)
+        return replace(self, occupancy=occ.astype(np.float32), labels=lab, fine=fine, surface=surf)
+
+    def profile(self, thr: float = 0.55, thin: float = 0.2) -> np.ndarray:
+        """Solid cells as written in the text: cells filled at least ``thr``, plus thinner ones (``thin``) that are
+        separated from those by a gap above and below (a wing made of tiles), with closed cavities filled - only
+        gaps that are open to the outside remain, as in a visual hull."""
+        occ = self.symmetrized().occupancy
+        strong = occ >= thr
+        near = strong.copy()
+        near[:, :, 1:] |= strong[:, :, :-1]
+        near[:, :, :-1] |= strong[:, :, 1:]
+        solid = strong | ((occ >= thin) & ~near)
+        return ndimage.binary_fill_holes(solid)
+
+    def cell_classes(self, solid: np.ndarray) -> np.ndarray:
+        """Colour class of every solid cell: its own visible surface; otherwise (inside the body) the nearest known
+        cell above in its column, else below; else the main colour."""
+        main = class_of_name(self.colors[0]) if self.colors else CLASS_INDEX["s"]
+        known = self.symmetrized().surface if self.surface is not None else np.full(solid.shape, -1, np.int8)
+        known = np.where(solid, known, -1)
+        out = np.full(solid.shape, -1, dtype=np.int64)
+        for i, j in np.argwhere(solid.any(2)):
+            col, k = known[i, j], np.nonzero(solid[i, j])[0]
+            vals = col[k]
+            if (vals >= 0).any():
+                pos = k[vals >= 0]
+                for kk in k:
+                    above = pos[pos >= kk]
+                    out[i, j, kk] = col[above.min()] if len(above) else col[pos.max()]
+            else:
+                out[i, j, k] = main
+        return out
 
     def allowed(self, margin=(1, 1, 2), thr: float = 0.3) -> np.ndarray:
         """Cells a generated part may occupy: the (loosely thresholded) shape dilated by ``margin`` cells."""
@@ -119,7 +175,70 @@ class CarDescriptor:
             lab[ii, jj] = labs[ii, jj, top[ii, jj]]
         return top, bottom, lab
 
-    def to_text(self, style: str | None = None, thr: float = 0.55) -> str:
+    def segments(self, max_segments: int = 3) -> tuple[np.ndarray, list]:
+        """(profile, per (row, half column) list of (bottom, top) runs); at most ``max_segments`` per column (the
+        smallest gaps are closed first)."""
+        solid = self.profile()
+        half = self.spec.width // 2
+        out = []
+        for i in range(solid.shape[0]):
+            row = []
+            for j in range(half, solid.shape[1]):
+                k = np.nonzero(solid[i, j])[0]
+                runs = []
+                for kk in k:
+                    if runs and kk == runs[-1][1] + 1:
+                        runs[-1][1] = kk
+                    else:
+                        runs.append([kk, kk])
+                while len(runs) > max_segments:
+                    g = int(np.argmin([runs[n + 1][0] - runs[n][1] for n in range(len(runs) - 1)]))
+                    runs[g : g + 2] = [[runs[g][0], runs[g + 1][1]]]
+                    solid[i, j, runs[g][0] : runs[g][1] + 1] = True
+                    solid[i, 2 * half - 1 - j, runs[g][0] : runs[g][1] + 1] = True
+                row.append([tuple(r) for r in runs])
+            out.append(row)
+        return solid, out
+
+    def to_text(self, style: str | None = None, thr: float = 0.55, fmt: str = "v2") -> str:
+        if fmt == "v1":
+            return self._to_text_v1(style, thr)
+        solid, segs = self.segments()
+        cls = self.cell_classes(solid)
+        half = self.spec.width // 2
+        L, W, H = (0, 0, 0) if not solid.any() else tuple(int(v) for v in np.ptp(np.argwhere(solid), 0) + 1)
+        lines = [f"<{style}>"] if style else []
+        lines.append(f"car {L}x{W}x{H}")
+        if self.wheels:
+            lines.append("wheels " + " ".join(f"{w:g}" for w in self.wheels))
+        if self.colors:
+            lines.append("colors " + ", ".join(self.colors))
+        for i, row in enumerate(segs):
+            if not any(row):
+                continue
+            cells = []
+            for j, runs in enumerate(row):
+                if not runs:
+                    cells.append(".")
+                    continue
+                parts = []
+                for b, t in runs:
+                    c = cls[i, half + j, b : t + 1]
+                    txt, n = str(b), 1
+                    for kk in range(1, len(c) + 1):
+                        if kk < len(c) and c[kk] == c[kk - 1]:
+                            n += 1
+                            continue
+                        txt += f"{CLASSES[c[kk - 1]]}{n}"
+                        n = 1
+                    parts.append(txt)
+                cells.append("+".join(parts))
+            while cells and cells[-1] == ".":
+                cells.pop()
+            lines.append(f"{i} " + " ".join(cells))
+        return "\n".join(lines)
+
+    def _to_text_v1(self, style: str | None = None, thr: float = 0.55) -> str:
         top, bottom, lab = self.half_heightmap(thr)
         rows = np.nonzero((top >= 0).any(1))[0]
         L, W, H = self.size(thr)
@@ -146,6 +265,7 @@ class CarDescriptor:
         spec = spec or GridSpec()
         occ = np.zeros(spec.shape, dtype=np.float32)
         labels = np.zeros(spec.shape, dtype=np.uint8)
+        surface = np.full(spec.shape, -1, dtype=np.int8)
         wheels, colors = (), ()
         half = spec.width // 2
         for line in text.strip().splitlines():
@@ -159,6 +279,16 @@ class CarDescriptor:
             elif tok[0].isdigit():
                 i = int(tok[0])
                 for j, cell in enumerate(tok[1:]):
+                    if i < spec.length and j < half and V2_CELL_RE.fullmatch(cell):
+                        for seg in cell.split("+"):
+                            k = int(re.match(r"\d+", seg)[0])
+                            for c, n in re.findall(r"([a-z])(\d+)", seg):
+                                for kk in range(k, min(k + int(n), spec.height)):
+                                    for jj in (half + j, half - 1 - j):
+                                        occ[i, jj, kk] = 1.0
+                                        surface[i, jj, kk] = CLASS_INDEX[c]
+                                k += int(n)
+                        continue
                     m = re.fullmatch(r"(\d+)([a-z]?)/(\d+)", cell)
                     if m is None or i >= spec.length or j >= half:
                         continue
@@ -167,7 +297,8 @@ class CarDescriptor:
                         occ[i, jj, b : t + 1] = 1.0
                         if lab:
                             labels[i, jj, t] = LABEL_CODES[lab]
-        return cls(occ, spec, np.zeros(3), wheels, colors, labels if labels.any() else None)
+        return cls(occ, spec, np.zeros(3), wheels, colors, labels if labels.any() else None,
+                   surface=surface if (surface >= 0).any() else None)
 
     # ---- augmentation -----------------------------------------------------------------------------------------
     def perturb(self, rng: np.random.Generator, strength: float = 1.0) -> "CarDescriptor":
@@ -195,8 +326,25 @@ class CarDescriptor:
                 solid[i, j, top + 1] = True
             elif top > ks.min():
                 solid[i, j, top] = False
+        # parts above a gap (wings, frames) and thin parts would not survive the (vertical) blur: keep them, mostly
+        sym = self.symmetrized().occupancy
+        prof = self.profile()
+        started = np.maximum.accumulate(prof, axis=2)
+        above_gap = prof & np.maximum.accumulate(started & ~prof, axis=2)
+        keep = above_gap | (prof & (sym > 0) & (sym < 0.55))
+        if keep.any() and rng.uniform() < 0.85:
+            solid |= keep
         wheels = tuple(round(w + rng.uniform(-0.5, 0.5) * strength, 1) for w in self.wheels)
-        out = replace(self, occupancy=solid.astype(np.float32), wheels=wheels, fine=None)
+        surface = self.surface
+        if surface is not None:
+            surface = surface.copy()
+            # photos without window / light masks: glass reads as dark paint, lamps as the body colour
+            if rng.uniform() < 0.35 * strength:
+                surface[surface == GLASS] = CLASS_INDEX["k"] if rng.uniform() < 0.6 else CLASS_INDEX["g"]
+            if rng.uniform() < 0.3 * strength:
+                surface[surface == LIGHT] = class_of_name(self.colors[0]) if self.colors else -1
+            surface[rng.uniform(size=surface.shape) < 0.05 * strength] = -1  # unseen cells: inherit from above
+        out = replace(self, occupancy=solid.astype(np.float32), wheels=wheels, fine=None, surface=surface)
         return out.symmetrized()
 
     # ---- io ---------------------------------------------------------------------------------------------------
@@ -210,6 +358,7 @@ class CarDescriptor:
             colors=np.array(self.colors, dtype=str),
             labels=self.labels if self.labels is not None else np.zeros(0, dtype=np.uint8),
             fine=np.packbits(self.fine) if self.fine is not None else np.zeros(0, dtype=np.uint8),
+            surface=self.surface if self.surface is not None else np.zeros(0, dtype=np.int8),
         )
 
     @classmethod
@@ -222,9 +371,18 @@ class CarDescriptor:
         if "fine" in d.files and d["fine"].size:
             n = np.array(spec.shape) * np.array(spec.sub)
             fine = np.unpackbits(d["fine"])[: n.prod()].reshape(n).astype(bool)
+        surface = d["surface"] if "surface" in d.files and d["surface"].size else None
         return cls(
             d["occupancy"], spec, d["origin"], tuple(d["wheels"].tolist()), tuple(d["colors"].tolist()), labels, fine,
+            surface,
         )
+
+
+def column_filled(solid: np.ndarray) -> np.ndarray:
+    """Fill every vertical column between its lowest and highest solid cell."""
+    up = np.maximum.accumulate(solid, axis=2)
+    down = np.maximum.accumulate(solid[:, :, ::-1], axis=2)[:, :, ::-1]
+    return up & down
 
 
 def detect_wheels(occupancy: np.ndarray, thr: float = 0.25, tol: int = 0) -> tuple[float, ...]:
@@ -261,13 +419,27 @@ def descriptor_from_points(
     center_y: float | None = None,
     colors: tuple[str, ...] = (),
     point_labels: np.ndarray | None = None,
+    point_classes: np.ndarray | None = None,
+    color_points: np.ndarray | None = None,
+    color_classes: np.ndarray | None = None,
     min_count: int = 1,
+    snap: float | None = None,
 ) -> CarDescriptor:
     """Bin interior points (car frame, LDU, z up) into a descriptor.
 
     The grid is placed so that the object's lowest point is at z = 0, its lateral centre (``center_y``, default
     the midpoint of the y extent) is on the grid's centre plane, and it is centred along x by a whole number of
     studs (stud boundaries of a LEGO model stay aligned with cell boundaries).
+
+    ``snap`` (LEGO models): round the lateral centre to a multiple of ``snap`` and the origin to whole LDU, so that
+    parts on the LDraw grid get integer grid poses (the ``@root`` line stores integers; a fractional origin would
+    shift the decoded model and flip anchors that sit on cell boundaries).
+
+    Surface colours (``colors.CLASSES`` indices, -1 unknown), either
+    * ``point_classes`` for the interior ``points`` (LEGO: the part's colour) - a cell takes the majority class of
+      its sub-cells on the outside of the object (next to empty space connected to the grid border), so parts
+      hidden inside the body do not count; or
+    * ``color_points`` / ``color_classes``: surface samples (mesh, photos) - majority class per cell.
     """
     spec = spec or GridSpec()
     pts = np.asarray(points, dtype=np.float64)
@@ -276,12 +448,19 @@ def descriptor_from_points(
     cell = spec.cell
     lo, hi = pts.min(0), pts.max(0)
     cy = 0.5 * (lo[1] + hi[1]) if center_y is None else center_y
+    if snap:
+        cy = round(cy / snap) * snap
     pad_x = np.floor((spec.length * cell[0] - (hi[0] - lo[0])) / 2 / cell[0]) * cell[0]
     origin = np.array([lo[0] - max(pad_x, 0.0), cy - spec.width * cell[1] / 2, lo[2]])
+    if snap:
+        origin = np.round(origin)
 
     sub = np.array(spec.sub)
     n = np.array(spec.shape) * sub
-    idx = np.floor((pts - origin) / (cell / sub)).astype(np.int64)
+    # points on a lattice with the sub-cell pitch (``interior_points_from_surface``) sit exactly on bin centres
+    # relative to ``origin``; without the epsilon, round-off sends a whole slice into its neighbour (an empty plate
+    # layer that splits the car in two, next to a doubled one)
+    idx = np.floor((pts - origin) / (cell / sub) + 1e-6).astype(np.int64)
     keep = ((idx >= 0) & (idx < n)).all(1)
     idx = idx[keep]
     counts = np.zeros(n, dtype=np.int32)
@@ -300,4 +479,38 @@ def descriptor_from_points(
             m = lab == code
             labels[tuple(cidx[m].T)] = code
     occ = occ.astype(np.float32)
-    return CarDescriptor(occ, spec, origin, detect_wheels(occ), tuple(colors), labels, fine)
+    surface = None
+    n_cls = len(CLASSES)
+    if color_points is not None and color_classes is not None:
+        cp = np.asarray(color_points, dtype=np.float64)
+        cc = np.asarray(color_classes)
+        ci = np.floor((cp - origin) / cell + 1e-6).astype(np.int64)
+        ok = ((ci >= 0) & (ci < np.array(spec.shape))).all(1) & (cc >= 0)
+        surface = _majority(ci[ok], cc[ok], spec.shape, n_cls)
+    elif point_classes is not None:
+        pc = np.asarray(point_classes)[keep]
+        ok = pc >= 0
+        counts_c = np.zeros((*n, n_cls), dtype=np.int32)
+        np.add.at(counts_c, (*idx[ok].T, pc[ok]), 1)
+        exterior = ~ndimage.binary_fill_holes(fine)
+        exposed = fine & ndimage.binary_dilation(exterior)
+        fi = np.argwhere(exposed)
+        fcls = counts_c[tuple(fi.T)].argmax(1)
+        has = counts_c[tuple(fi.T)].sum(1) > 0
+        surface = _majority(fi[has] // sub, fcls[has], spec.shape, n_cls)
+    return CarDescriptor(occ, spec, origin, detect_wheels(occ), tuple(colors), labels, fine, surface)
+
+
+def with_surface_samples(desc: CarDescriptor, points: np.ndarray, classes: np.ndarray) -> CarDescriptor:
+    """``desc`` with its surface colours from coloured surface samples (grid placement as in ``desc``)."""
+    pts, cls = np.asarray(points, dtype=np.float64), np.asarray(classes)
+    ci = np.floor((pts - desc.origin) / desc.spec.cell + 1e-6).astype(np.int64)
+    ok = ((ci >= 0) & (ci < np.array(desc.spec.shape))).all(1) & (cls >= 0)
+    return replace(desc, surface=_majority(ci[ok], cls[ok], desc.spec.shape, len(CLASSES)))
+
+
+def _majority(cells: np.ndarray, classes: np.ndarray, shape, n_cls: int) -> np.ndarray:
+    """Most frequent class per cell (-1 where none)."""
+    counts = np.zeros((*shape, n_cls), dtype=np.int32)
+    np.add.at(counts, (*np.asarray(cells).T, np.asarray(classes)), 1)
+    return np.where(counts.sum(-1) > 0, counts.argmax(-1), -1).astype(np.int8)

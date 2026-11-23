@@ -101,8 +101,14 @@ def cmd_generate(a):
 
     desc = CarDescriptor.load(a.desc)
     shapes = PartShapes(a.shapes)
-    proposer = HFProposer.load(a.model, a.lora, temperature=a.temperature)
-    dec = ConstrainedDecoder(proposer, shapes, DecodeConfig(max_parts=a.max_parts, candidates=a.candidates))
+    if a.snap:  # target-first model (build-data --target-first): KV-cached, program-chosen connections
+        from .snapdecode import CachedLM, SnapConfig, SnapDecoder
+
+        lm = CachedLM.load(a.model, a.lora, temperature=a.temperature)
+        dec = SnapDecoder(lm, shapes, SnapConfig(max_parts=a.max_parts, target_tol=a.target_tol))
+    else:
+        proposer = HFProposer.load(a.model, a.lora, temperature=a.temperature)
+        dec = ConstrainedDecoder(proposer, shapes, DecodeConfig(max_parts=a.max_parts, candidates=a.candidates))
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -202,6 +208,9 @@ def main(argv=None):
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--style", default="official")
     p.add_argument("--recolor", action="store_true", help="map generated colours onto the descriptor's colours")
+    p.add_argument("--snap", action="store_true",
+                   help="target-first model: model picks target cell + part, the program enumerates the connections")
+    p.add_argument("--target-tol", type=int, default=0, help="--snap: cells of slack around the target")
     p.add_argument("--shapes", default="auto", choices=["auto", "cvx", "ldraw", "connector"])
     p.set_defaults(func=cmd_generate)
 

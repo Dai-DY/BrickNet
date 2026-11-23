@@ -24,7 +24,7 @@ from scipy.spatial import ConvexHull, QhullError
 
 import bricknet
 
-from .units import LDU_PER_PLATE
+from .units import LDU_PER_PLATE, LDU_PER_STUD
 
 
 def bricknet_data_dir() -> Path:
@@ -38,6 +38,63 @@ def bricknet_data_dir() -> Path:
 
 # lattice spacing (LDU) for interior sampling; finer than the descriptor's supersample cell (10 x 10 x 4)
 SAMPLE_STEP = np.array([4.0, 2.0, 4.0])  # LDraw-local x, y (vertical), z
+LATTICE_OFFSET = np.array([0.0, 1.0, 0.0])
+STUD_RADIUS, STUD_HEIGHT = 6.5, 4.5  # LDU, with a little slack around the 6 x 4 LDU stud
+
+
+def _drop_studs(pts: np.ndarray, part_id: int) -> np.ndarray:
+    """Remove the points inside the part's studs (cylinders on top of each stud connector)."""
+    frames = bricknet.load_connectors().get(part_id, {}).get(("stud", None), ())
+    if not len(frames) or not len(pts):
+        return pts
+    keep = np.ones(len(pts), dtype=bool)
+    for f in frames:
+        axis = f[:3, :3] @ np.array([0.0, -1.0, 0.0])  # a stud rises along its frame's -Y
+        d = pts - f[:3, 3]
+        h = d @ axis
+        r = np.linalg.norm(d - h[:, None] * axis, axis=1)
+        keep &= ~((h > 0) & (h <= STUD_HEIGHT) & (r <= STUD_RADIUS))
+    return pts[keep] if keep.any() else pts
+
+
+def _fill_under_holes(pts: np.ndarray, part_id: int) -> np.ndarray:
+    """Lattice points (``SAMPLE_STEP`` multiples + ``LATTICE_OFFSET``) -> the same points plus, above every downward
+    anti-stud ("hole" connector), the column from that hole up to the part's material (LDraw local: +y is down).
+
+    The hollow underside of a brick / plate / tile / studded slope is exactly where the studs of the part below go,
+    so in a built model it is volume. Using the labelled holes (not the geometry: BrickNet's colliders leave out
+    thin walls, e.g. the long sides of a 2x4 brick) also keeps open undersides open: an arch has holes under its
+    legs only."""
+    if len(pts) < 2:
+        return pts
+    holes = [f for (sub, _), group in bricknet.load_connectors().get(part_id, {}).items() if sub == "hole"
+             for f in group]
+    holes = [f for f in holes if abs((f[:3, :3] @ np.array([0.0, -1.0, 0.0]))[1]) > 0.99]  # vertical ones only
+    if not holes:
+        return pts
+    # global lattice indices (off-lattice centroid fallbacks of tiny hulls snap to the nearest node); the box also
+    # spans the holes, which sit at the bottom face below the lowest sampled row
+    gi = np.round((pts - LATTICE_OFFSET) / SAMPLE_STEP).astype(int)
+    lo, hi = pts.min(0), pts.max(0)
+    hp = np.array([f[:3, 3] for f in holes])
+    reach = np.array([LDU_PER_STUD / 2, 0.0, LDU_PER_STUD / 2])
+    g0 = np.minimum(gi.min(0), np.floor((hp - reach - LATTICE_OFFSET) / SAMPLE_STEP).min(0).astype(int))
+    g1 = np.maximum(gi.max(0), np.ceil((hp + reach - LATTICE_OFFSET) / SAMPLE_STEP).max(0).astype(int))
+    vol = np.zeros(g1 - g0 + 1, dtype=bool)
+    vol[tuple((gi - g0).T)] = True
+    cx, cy, cz = (LATTICE_OFFSET[a] + (g0[a] + np.arange(vol.shape[a])) * SAMPLE_STEP[a] for a in range(3))
+    has = vol.any(1)
+    top = np.where(has, vol.argmax(1), vol.shape[1])  # first filled row from the top, per (x, z) column
+    rows = np.arange(vol.shape[1])[None, :, None]
+    for hx, hy, hz in hp:
+        # a stud cell, edges included (a lattice row may sit between two holes), but not past the part's sides
+        ix = np.flatnonzero((np.abs(cx - hx) <= LDU_PER_STUD / 2 + 1e-6) & (cx >= lo[0]) & (cx <= hi[0]))
+        iz = np.flatnonzero((np.abs(cz - hz) <= LDU_PER_STUD / 2 + 1e-6) & (cz >= lo[2]) & (cz <= hi[2]))
+        if not len(ix) or not len(iz):
+            continue
+        col_top = top[np.ix_(ix, iz)][:, None, :]
+        vol[np.ix_(ix, np.arange(vol.shape[1]), iz)] |= (rows >= col_top) & (cy[None, :, None] < hy)
+    return LATTICE_OFFSET + (g0 + np.argwhere(vol)) * SAMPLE_STEP
 
 
 def _hull_equations(verts: np.ndarray) -> np.ndarray | None:
@@ -178,6 +235,12 @@ class PartShapes:
 
     @lru_cache(maxsize=None)
     def hulls(self, part_id: int) -> tuple[np.ndarray, ...]:
+        if self.backend == "auto":
+            # studded slopes: the analytic wedge is their exact envelope, while the colliders' thin top step under the
+            # stud row falls between lattice points (the part comes out a half plate short and lopsided)
+            wedge = self._studded_slope_hull(part_id)
+            if wedge is not None:
+                return (wedge,)
         order = {"auto": ("cvx", "ldraw", "connector")}.get(self.backend, (self.backend,))
         for name in order:
             h = getattr(self, f"_{name}_hulls")(part_id)
@@ -187,19 +250,37 @@ class PartShapes:
 
     @lru_cache(maxsize=None)
     def local_interior(self, part_id: int) -> np.ndarray:
-        """Lattice points inside the part (local LDU). Always returns at least the hull centroids."""
-        out = []
-        for verts in self.hulls(part_id):
-            eq = _hull_equations(verts)
-            lo, hi = verts.min(0), verts.max(0)
-            axes = [np.arange(lo[a] + SAMPLE_STEP[a] / 2, hi[a], SAMPLE_STEP[a]) for a in range(3)]
-            if eq is None or any(len(a) == 0 for a in axes):
-                out.append(verts.mean(0, keepdims=True))
-                continue
-            grid = np.stack(np.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
-            inside = (grid @ eq[:, :3].T + eq[:, 3] <= 1e-6).all(1)
-            out.append(grid[inside] if inside.any() else verts.mean(0, keepdims=True))
-        return np.concatenate(out)
+        """Lattice points inside the part's envelope (local LDU); the hull centroids if no lattice point is inside.
+
+        Real bricks, plates, tiles and studded slopes are hollow underneath (walls and tubes only): a brick fills
+        about 37 % of its box, below the descriptor's 55 % solid threshold, so models built from real geometry
+        would look hollow while the same model from connector hulls - or a real car - looks solid. In a built model
+        that cavity is taken by the studs of the part below, so it counts as volume: the columns above the part's
+        downward anti-studs are filled up to its material (``_fill_under_holes``). Open undersides (arches) have no
+        anti-studs there and stay open.
+
+        For the same reason studs are left out: they sit inside the part above (counted there), and as a separate
+        half-plate of volume on top they would block any part from being stacked in a sub-cell grid."""
+        hulls = self.hulls(part_id)
+        pts = np.concatenate([self._hull_lattice(v) for v in hulls])
+        if not len(pts):  # every hull thinner than the lattice: fall back to their centroids
+            return np.array([np.asarray(v).mean(0) for v in hulls])
+        return _fill_under_holes(_drop_studs(pts, part_id), part_id)
+
+    @staticmethod
+    def _hull_lattice(verts: np.ndarray) -> np.ndarray:
+        eq = _hull_equations(verts)
+        lo, hi = verts.min(0), verts.max(0)
+        # one lattice for all hulls of a part, so their samples line up; its points sit strictly inside stud cells
+        # (x, z: multiples of 4 -> -8..8 across a 20 LDU stud) and plate layers (y: odd -> 1, 3, 5, 7 in 0..8)
+        axes = [np.arange(np.floor(lo[a] / SAMPLE_STEP[a]) * SAMPLE_STEP[a] + LATTICE_OFFSET[a], hi[a],
+                          SAMPLE_STEP[a]) for a in range(3)]
+        axes = [ax[(ax > lo[a]) & (ax < hi[a])] for a, ax in enumerate(axes)]
+        if eq is None or any(len(a) == 0 for a in axes):
+            return np.empty((0, 3))  # thinner than the lattice (walls, tube rims): covered by its neighbours
+        grid = np.stack(np.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
+        inside = (grid @ eq[:, :3].T + eq[:, 3] <= 1e-6).all(1)
+        return grid[inside]
 
     def interior_points(self, part_ids, transforms) -> np.ndarray:
         """World-space interior points of a placed model (same frame as ``transforms``)."""

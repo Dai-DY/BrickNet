@@ -31,11 +31,33 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=300)
     ap.add_argument("--eval_interval", type=int, default=500)
     ap.add_argument("--save_interval", type=int, default=1000)
+    ap.add_argument("--micro_batch", type=int, default=1,
+                    help="sequences per forward pass; the rest of --batch is gradient accumulation")
+    ap.add_argument("--no_grad_ckpt", action="store_true", help="disable gradient checkpointing (needs much memory)")
+    ap.add_argument("--no_compile", action="store_true", help="disable torch.compile (faster start, a bit slower)")
     known, rest = ap.parse_known_args()
 
     spec = importlib.util.spec_from_file_location("bricknet_train", Path(__file__).with_name("train.py"))
     train = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(train)
+
+    # BrickNet's recipe puts the whole global batch on the device and keeps all activations, which is fine for its
+    # ~2.8k-token SFT samples; car sequences reach ~12k tokens, so on one 16 GB card we need gradient checkpointing
+    # and accumulation. Patched here instead of editing train.py.
+    base_args = train.TrainingArguments
+
+    def training_arguments(*a, **kw):
+        micro = max(1, min(known.micro_batch, known.batch))
+        kw["per_device_train_batch_size"] = kw["per_device_eval_batch_size"] = micro
+        kw["gradient_accumulation_steps"] = max(1, known.batch // micro)
+        if not known.no_grad_ckpt:
+            kw["gradient_checkpointing"] = True
+            kw["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+        if known.no_compile:
+            kw["torch_compile"] = False
+        return base_args(*a, **kw)
+
+    train.TrainingArguments = training_arguments
     train.RECIPES["sft"].update(
         max_len=known.max_len,
         train_iters=known.iters,

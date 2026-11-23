@@ -77,7 +77,12 @@ def photos_to_descriptor(
         labels[surf] = project_labels(world[surf], cameras, lm)
     body_rgb = rgb[(labels[surf] == 1) & ~np.isnan(rgb).any(1)]
     cols = palette.dominant(body_rgb)
-    out = descriptor_from_points(pts_car, spec or desc.spec, center_y=0.0, colors=cols, point_labels=labels)
+    # surface colour classes; glass / lights from the label masks when given (otherwise windows read as dark paint,
+    # which the training augmentation also produces)
+    classes = palette.class_of_rgb(rgb)
+    classes = np.where(labels[surf] == 2, palette.GLASS, np.where(labels[surf] == 3, palette.LIGHT, classes))
+    out = descriptor_from_points(pts_car, spec or desc.spec, center_y=0.0, colors=cols, point_labels=labels,
+                                 color_points=pts_car[surf], color_classes=classes)
     # the hull cannot see under the car, so prefer tyre colour over the occupancy contact profile
     wx = wheels_from_dark_points(pts_car[surf], rgb)
     if wx:

@@ -61,6 +61,7 @@ def evaluate(part_ids, grid_poses, target: CarDescriptor, shapes: PartShapes | N
         return out | {"iou": 0.0, "components": 0}
     gen = grid_occupancy(part_ids, grid_poses, target, shapes)
     out["iou"] = gen.iou(target)
+    out["iou_filled"] = gen.iou(target, filled=True)
     out["size"] = gen.size()
     graph = bricknet.parse_ldr(poses_to_ldr(part_ids, colors or [4] * len(part_ids), grid_poses))
     out["components"] = len(graph.components)
@@ -86,6 +87,7 @@ def evaluate_ldr(ldr_text: str, target: CarDescriptor, shapes: PartShapes | None
     return {
         "parts": len(graph.part_ids),
         "iou": lc.descriptor.iou(target),
+        "iou_filled": lc.descriptor.iou(target, filled=True),
         "size": lc.descriptor.size(),
         "components": len(graph.components),
     }

@@ -132,7 +132,9 @@ def canonicalize(
 
 
 def interior_points_from_surface(surface_pts: np.ndarray, close_iters: int = 2) -> np.ndarray:
-    """Surface samples (car frame, LDU) -> centres of filled half-stud x half-stud x half-plate cells."""
+    """Surface samples (car frame, LDU) -> centres of filled half-stud x half-stud x half-plate cells.
+
+    Not for visual hulls (already solid): this is for surfaces - meshes and dense point clouds."""
     pts = np.asarray(surface_pts, dtype=np.float64)
     lo = pts.min(0) - (close_iters + 2) * SUBCELL
     idx = np.floor((pts - lo) / SUBCELL).astype(int)
@@ -141,9 +143,16 @@ def interior_points_from_surface(surface_pts: np.ndarray, close_iters: int = 2) 
     vol[tuple(idx.T)] = True
     if close_iters:
         vol = ndimage.binary_closing(vol, iterations=close_iters)
-    vol = ndimage.binary_fill_holes(vol)
-    for i in range(vol.shape[0]):  # cross-sections (y, z) of a car are simply connected
-        vol[i] = ndimage.binary_fill_holes(vol[i])
+    filled = ndimage.binary_fill_holes(vol)
+    # Slices of a car along any axis are (nearly) simply connected, but a non-watertight mesh (open windows,
+    # missing panels) leaves some slices open, and a single open slice must not cut the car in two. So take the
+    # union of 2D hole filling along all three axes: a cell is inside if it is enclosed in any of its slices.
+    for axis in range(3):
+        moved = np.moveaxis(vol, axis, 0)
+        out = np.moveaxis(filled, axis, 0)
+        for i in range(moved.shape[0]):
+            out[i] |= ndimage.binary_fill_holes(moved[i])
+    vol = filled
     cells = np.argwhere(vol)
     return lo + (cells + 0.5) * SUBCELL
 
@@ -158,11 +167,13 @@ def mesh_surface_points(mesh, count: int = 200000, seed: int = 0) -> np.ndarray:
     return np.concatenate([np.asarray(pts), np.asarray(mesh.vertices)])
 
 
-def mesh_descriptor(mesh, *, up_hint=None, front_hint=None, target_width: float = 8.0, spec=None, colors=()):
+def mesh_descriptor(mesh, *, up_hint=None, front_hint=None, target_width: float = 8.0, spec=None, colors=(),
+                    width_band: tuple[float, float] = (0.25, 0.75)):
     """Mesh (any frame, any scale) -> CarDescriptor. Returns (descriptor, canonicalization)."""
     from .descriptor import descriptor_from_points
 
     surf = mesh_surface_points(mesh)
-    canon = canonicalize(surf, up_hint=up_hint, front_hint=front_hint, target_width=target_width)
+    canon = canonicalize(surf, up_hint=up_hint, front_hint=front_hint, target_width=target_width,
+                         width_band=width_band)
     inner = interior_points_from_surface(canon.apply(surf))
     return descriptor_from_points(inner, spec, center_y=0.0, colors=colors), canon

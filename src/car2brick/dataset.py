@@ -21,6 +21,8 @@ from __future__ import annotations
 import argparse
 import json
 import lzma
+import re
+import zlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -30,7 +32,8 @@ import bricknet
 
 from .geometry import PartShapes
 from .ldraw_io import flatten
-from .lego import is_wheel, lego_car_from_graph
+from .lego import is_wheel, lego_car
+from .library import car_like, rough_size, stud_up, upright
 from .sequence import anchored_text, order_tree
 
 OFFICIAL_WORDS = ("speed champions", "speed champion")
@@ -64,6 +67,31 @@ def iter_sources(graphs: list[str], ldr_dirs: list[str], captions: list[str | No
             yield p.stem, bricknet.parse_ldr(flat.text), flat.steps, ""
 
 
+FIGURE_RE = re.compile(r"^(minifig|figure|bigfig)\b")
+
+
+def is_figure(part_id: int) -> bool:
+    """Minifigures, figures and their accessories (not part of the car)."""
+    return bool(FIGURE_RE.match(bricknet.load_catalog().id_to_name[part_id].lower()))
+
+
+def drop_figures(graph: bricknet.Graph, steps=None):
+    """The graph without figure parts (edges and components rebuilt), and the matching instruction steps."""
+    keep = np.array([not is_figure(p) for p in graph.part_ids], dtype=bool)
+    if keep.all():
+        return graph, steps
+    from bricknet.graph import _components_from_edges
+
+    transforms = graph.transforms if graph.transforms is not None else bricknet.decode_graph(graph)
+    new = np.cumsum(keep) - 1
+    e = graph.edges[keep[graph.edges["a"]] & keep[graph.edges["b"]]].copy()
+    e["a"], e["b"] = new[e["a"]], new[e["b"]]
+    idx = np.nonzero(keep)[0]
+    out = bricknet.Graph(tuple(graph.part_ids[i] for i in idx), tuple(graph.colors[i] for i in idx),
+                         np.asarray(transforms)[idx], e, _components_from_edges(len(idx), e["a"], e["b"]))
+    return out, (None if steps is None else [steps[i] for i in idx])
+
+
 def keep_car(graph: bricknet.Graph, min_wheels: int, width: tuple[float, float], max_parts: int) -> bool:
     if not graph.components:
         return False
@@ -86,6 +114,13 @@ def _sanitize_colors(graph: bricknet.Graph) -> bricknet.Graph:
     return replace(graph, colors=tuple(c if c in known else 71 for c in graph.colors))
 
 
+def split_of(source: str, val_frac: float, seed: int = 0) -> str:
+    """Train / val split from a hash of the car id, so a car stays on the same side when the data is rebuilt
+    with other options (a draw from the shared generator moved 10 % of the cars between rebuilds)."""
+    h = zlib.crc32(f"{seed}:{source}".encode()) / 2**32
+    return "val" if h < val_frac else "train"
+
+
 def build(args) -> dict:
     out = Path(args.out)
     (out / "descriptors").mkdir(parents=True, exist_ok=True)
@@ -102,26 +137,40 @@ def build(args) -> dict:
             counts["seen"] += 1
             if args.limit and counts["kept"] >= args.limit:
                 break
+            if args.drop_figures:
+                try:
+                    graph, steps = drop_figures(graph, steps)
+                except Exception as e:
+                    counts["errors"] += 1
+                    print(f"[skip] {source}: {type(e).__name__}: {e}")
+                    continue
             if not keep_car(graph, args.min_wheels, (args.min_width, args.max_width), args.max_parts):
                 continue
             try:
                 graph = _sanitize_colors(graph)
-                lc = lego_car_from_graph(graph, component=0, shapes=shapes)
+                comp = sorted(graph.components[0])
+                T = graph.transforms if graph.transforms is not None else bricknet.decode_graph(graph)
+                pids, cols = [graph.part_ids[j] for j in comp], [graph.colors[j] for j in comp]
+                # stand the car stud-up (about one BrickNet component in six lies on its side / upside down); the
+                # rotation is shared by all parts, so the connection tree and its relative edges are unchanged
+                tr = upright([T[j] for j in comp], stud_up(pids, [T[j] for j in comp]))
+                if args.car_filter and not car_like(rough_size(pids, tr), len(pids), args.min_wheels):
+                    continue
+                lc = lego_car(pids, cols, tr, shapes=shapes)
                 L, W, H = lc.descriptor.size()
                 if not (args.min_width <= W <= args.max_width) or L < 1.5 * W:
                     continue
                 gp_all = np.zeros((len(graph.part_ids), 4, 4))
-                comp = sorted(graph.components[0])
                 gp_all[comp] = lc.grid_poses()
                 comp_steps = steps if steps is not None else None
                 style = style_of(source, caption, W, official)
-                split = "val" if rng.uniform() < args.val_frac else "train"
+                split = split_of(source, args.val_frac, args.seed)
                 k = 0
                 fp, fc = files[split]
                 for r in range(args.orders):
                     tree, order = order_tree(graph, gp_all, 0, steps=comp_steps, rng=rng,
                                              jitter=0.0 if r == 0 else args.jitter)
-                    text = anchored_text(tree, gp_all[order[0]])
+                    text = anchored_text(tree, gp_all[order[0]], target_first=args.target_first)
                     for a in range(args.augs):
                         desc = lc.descriptor if a == 0 else lc.descriptor.perturb(rng, args.noise)
                         fp.write(json.dumps({"source": source, "round": 0, "sample_index": k, "component_index": 0,
@@ -157,6 +206,8 @@ def add_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--orders", type=int, default=2)
     ap.add_argument("--augs", type=int, default=3)
     ap.add_argument("--jitter", type=float, default=1.5)
+    ap.add_argument("--target-first", action="store_true",
+                    help="anchor line before each part (a predicted target, for snap decoding) instead of after it")
     ap.add_argument("--noise", type=float, default=1.0, help="descriptor perturbation strength")
     ap.add_argument("--min-wheels", type=int, default=3)
     ap.add_argument("--min-width", type=int, default=5)
@@ -166,3 +217,7 @@ def add_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--limit", type=int, default=0, help="stop after this many kept cars (0 = all)")
     ap.add_argument("--shapes", default="auto", choices=["auto", "cvx", "ldraw", "connector"])
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--keep-figures", dest="drop_figures", action="store_false",
+                    help="keep minifigures (dropped by default: they are not part of the car)")
+    ap.add_argument("--no-car-filter", dest="car_filter", action="store_false",
+                    help="skip the survey filter (5-11 wide, height/width 0.5-0.8, see library.car_like)")

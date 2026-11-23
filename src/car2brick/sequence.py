@@ -102,9 +102,11 @@ def root_line(pose: np.ndarray) -> str:
     return f"@root {x} {y} {z} r{code}"
 
 
+BOUNDARY_LDU = 0.05  # poses composed step by step and via decode_graph differ by up to ~0.02 LDU on cell boundaries
+
+
 def anchor_line(pose: np.ndarray) -> str:
-    # small epsilon: poses composed step by step and via decode_graph differ by ~1e-12 on cell boundaries
-    x, y, z = pose[:3, 3] + 1e-6
+    x, y, z = pose[:3, 3] + BOUNDARY_LDU
     return f"@ {int(np.floor(x / LDU_PER_STUD))} {int(np.floor(y / LDU_PER_STUD))} {int(np.floor(z / LDU_PER_PLATE))}"
 
 
@@ -118,13 +120,28 @@ def parse_root(line: str) -> np.ndarray | None:
     return pose
 
 
-def anchored_text(tree: bricknet.Tree, root_pose: np.ndarray) -> str:
+def anchored_text(tree: bricknet.Tree, root_pose: np.ndarray, target_first: bool = False) -> str:
+    """Path text with anchors. ``target_first``: each part's cell comes *before* its node and edge lines, so it is
+    a target the model predicts (and is trained on) rather than a position it is told afterwards:
+
+        @ 10 3 1                   <- where the next part goes (model)
+        b plate 2x10 | red         <- which part (model)
+        a stud stud m hole f 270   <- how it connects (program-enumerated, model-ranked: ``snapdecode``)
+    """
     base = bricknet.serialize_tree(tree).rstrip("\n").split("\n")
     poses = realize(tree, root_pose)
     out = [base[0], root_line(poses[0])]
     for i in range(1, len(tree.parts)):
-        out += [base[2 * i - 1], base[2 * i], anchor_line(poses[i])]
+        if target_first:
+            out += [anchor_line(poses[i]), base[2 * i - 1], base[2 * i]]
+        else:
+            out += [base[2 * i - 1], base[2 * i], anchor_line(poses[i])]
     return "\n".join(out) + "\n"
+
+
+def parse_anchor(line: str) -> tuple[int, int, int] | None:
+    m = ANCHOR_RE.match(line.strip())
+    return None if m is None else (int(m[1]), int(m[2]), int(m[3]))
 
 
 def strip_anchors(text: str) -> str:

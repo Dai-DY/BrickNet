@@ -10,9 +10,10 @@ import numpy as np
 
 import bricknet
 
+from .colors import GLASS, LIGHT, class_of_name
 from .descriptor import CarDescriptor, GridSpec, descriptor_from_points
 from .geometry import PartShapes
-from .units import homogeneous
+from .units import LDU_PER_STUD, homogeneous
 
 WHEEL_RE = re.compile(r"\b(wheel|tyre|tire|rim|hub)\b")
 # car = (X, Z, -Y) when the length runs along LDraw X; car = (Z, -X, -Y) when it runs along LDraw Z
@@ -65,12 +66,17 @@ def lego_car(part_ids, colors, transforms, shapes: PartShapes | None = None, spe
     rot = car_frame_from_ld(pts_ld)
     pts_car = pts_ld @ rot.T
     # semantic labels: transparent parts are glass; large glass -> window (2), small -> light (3)
-    labels = []
+    # surface colour classes: the part's colour; glass parts are windows (t) or, when small, lights (l)
+    labels, classes = [], []
     for pid, col, p in zip(part_ids, colors, per_part):
-        trans = color_name(col).startswith("trans")
-        labels.append(np.full(len(p), (2 if len(p) > 40 else 3) if trans else 1, dtype=np.uint8))
+        trans = "trans" in color_name(col)
+        lab = (2 if len(p) > 40 else 3) if trans else 1
+        labels.append(np.full(len(p), lab, dtype=np.uint8))
+        cls = (GLASS if lab == 2 else LIGHT) if trans else class_of_name(color_name(col))
+        classes.append(np.full(len(p), cls, dtype=np.int64))
     cols = dominant_colors(part_ids, colors, [len(p) for p in per_part])
-    desc = descriptor_from_points(pts_car, spec, colors=cols, point_labels=np.concatenate(labels))
+    desc = descriptor_from_points(pts_car, spec, colors=cols, point_labels=np.concatenate(labels),
+                                  point_classes=np.concatenate(classes), snap=LDU_PER_STUD / 2)
     grid_from_ld = homogeneous(np.eye(3), -desc.origin) @ homogeneous(rot)
     return LegoCar(tuple(part_ids), tuple(colors), transforms, desc, grid_from_ld)
 
